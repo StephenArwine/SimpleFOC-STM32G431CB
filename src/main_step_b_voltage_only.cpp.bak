@@ -1,17 +1,13 @@
 #include <Arduino.h>
 #include <SimpleFOC.h>
 
-// Step (c) closed-loop bring-up: velocity control with current sense added.
-// Still in voltage torque mode — the current loops aren't engaged yet, this
-// step just proves the LowsideCurrentSense path reads sensible Iq/Id so we
-// can switch to TorqueControlType::foc_current next.
+// Step (b) closed-loop bring-up: velocity control with AMT103 encoder,
+// voltage torque mode (no current loops yet). Goal is to prove sensor +
+// alignment + velocity PI before adding LowsideCurrentSense and Iq/Id loops.
 //
 // Hardware: B-G431B-ESC1 + 300Kv 14pp 76mΩ prop motor, AMT103 on J8
 //   (PB6=A, PB7=B, PB8=Z wired but unused, 2048 PPR -> 8192 cpr x4).
-//   PSU 16 V, 3 mΩ low-side shunts via on-chip OPAMPs (PGA gain -64/7).
-//
-// Shunt + gain values from SimpleFOC ESC1 reference example. Gain is
-// negative because the ESC1 wires the OPAMPs in inverting configuration.
+//   PSU 16 V, 1 mΩ low-side shunts (unused in this step).
 //
 // Z (index) is intentionally NOT passed to the Encoder ctor: SimpleFOC's
 // initFOC will then skip absoluteZeroSearch(), which spins the rotor at
@@ -35,17 +31,6 @@ BLDCDriver6PWM driver  = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
                                         A_PHASE_VH, A_PHASE_VL,
                                         A_PHASE_WH, A_PHASE_WL);
 Encoder        encoder = Encoder(A_ENCODER_A, A_ENCODER_B, ENCODER_PPR);
-LowsideCurrentSense current_sense = LowsideCurrentSense(
-  0.003f, -64.0f / 7.0f,
-  A_OP1_OUT, A_OP2_OUT, A_OP3_OUT
-);
-
-// LowsideCurrentSense takes over ADC1 in DMA-circular mode triggered by
-// TIM1, so analogRead(A_POTENTIOMETER) no longer works (PB12 is ADC1_IN11).
-// SimpleFOC's ESC1 init already samples the pot as rank 2 of the scan and
-// stores it in adcBuffer1[1] (with OPAMP_USE_INTERNAL_CHANNEL=1, default).
-// Grab the value directly from the DMA buffer.
-extern volatile uint16_t adcBuffer1[];
 
 void doA() { encoder.handleA(); }
 void doB() { encoder.handleB(); }
@@ -59,7 +44,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   SimpleFOCDebug::enable(&Serial);
-  Serial.println("==== ESC1 closed-loop velocity + current sense (read-only) ====");
+  Serial.println("==== ESC1 closed-loop velocity, voltage torque mode ====");
 
   pinMode(USER_BTN, INPUT_PULLUP);
   analogReadResolution(12);
@@ -76,17 +61,6 @@ void setup() {
     while (1) delay(1000);
   }
   motor.linkDriver(&driver);
-
-  // Current sense: read-only this step. Phase wiring on the ESC1 is fixed,
-  // so we skip the auto-alignment that injects voltages to figure out which
-  // ADC channel maps to which phase.
-  current_sense.linkDriver(&driver);
-  if (!current_sense.init()) {
-    Serial.println("current_sense.init FAILED");
-    while (1) delay(1000);
-  }
-  current_sense.skip_align = true;
-  motor.linkCurrentSense(&current_sense);
 
   motor.voltage_limit        = VOLTAGE_CEIL;
   motor.voltage_sensor_align = ALIGN_VOLTAGE;
@@ -131,7 +105,7 @@ void loop() {
   }
   last_btn_state = btn;
 
-  int   raw    = adcBuffer1[1];           // pot, sampled by current-sense DMA
+  int   raw    = analogRead(A_POTENTIOMETER);
   float pot    = raw / 4095.0f;
   float target = pot * MAX_VEL_RAD_S;
 
@@ -139,21 +113,11 @@ void loop() {
   motor.move(target);
 
   if (millis() - last_print_ms >= 500) {
-    // motor.current.q/d are NOT populated in voltage torque mode — read
-    // explicitly so we can verify the current-sense path before turning on
-    // the foc_current controller.
-    PhaseCurrent_s ph = current_sense.getPhaseCurrents();
-    DQCurrent_s    dq = current_sense.getFOCCurrents(motor.electrical_angle);
-
-    Serial.print("en=");      Serial.print(enabled ? 1 : 0);
-    Serial.print(" tgt=");    Serial.print(target, 2);
-    Serial.print(" vel=");    Serial.print(motor.shaft_velocity, 2);
-    Serial.print(" Uq=");     Serial.print(motor.voltage.q, 2);
-    Serial.print(" Ia=");     Serial.print(ph.a, 3);
-    Serial.print(" Ib=");     Serial.print(ph.b, 3);
-    Serial.print(" Ic=");     Serial.print(ph.c, 3);
-    Serial.print(" Iq=");     Serial.print(dq.q, 3);
-    Serial.print(" Id=");     Serial.println(dq.d, 3);
+    Serial.print("en=");       Serial.print(enabled ? 1 : 0);
+    Serial.print(" tgt=");     Serial.print(target, 2);
+    Serial.print(" vel=");     Serial.print(motor.shaft_velocity, 2);
+    Serial.print(" Uq=");      Serial.print(motor.voltage.q, 2);
+    Serial.print(" angle=");   Serial.println(motor.shaft_angle, 2);
     last_print_ms = millis();
   }
 }
