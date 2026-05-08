@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <SimpleFOC.h>
 
-// Step (d) closed-loop bring-up: full FOC with foc_current torque mode.
-// Outer velocity PI -> Iq setpoint -> inner Iq/Id PI -> Uq/Ud. This gives
-// hard current limiting, predictable torque-per-amp across speed, and is the
-// control mode we want for the balance bot's wheels.
+// Step (c) closed-loop bring-up: velocity control with current sense added.
+// Still in voltage torque mode — the current loops aren't engaged yet, this
+// step just proves the LowsideCurrentSense path reads sensible Iq/Id so we
+// can switch to TorqueControlType::foc_current next.
 //
 // Hardware: B-G431B-ESC1 + 300Kv 14pp 76mΩ prop motor, AMT103 on J8
 //   (PB6=A, PB7=B, PB8=Z wired but unused, 2048 PPR -> 8192 cpr x4).
@@ -22,14 +22,13 @@
 const int   POLE_PAIRS    = 14;
 const int   ENCODER_PPR   = 2048;
 const float PSU_VOLTAGE   = 16.0f;
-const float VOLTAGE_CEIL  = 3.0f;     // ceiling on Uq from the inner Iq PI
-// During initFOC's sensor alignment the motor settles at fixed electrical
-// positions for ~1 s each. With BEMF ≈ 0 the entire ALIGN_VOLTAGE is dropped
-// across the 76 mΩ phase resistance, so keep this at the level we proved
-// safe in the open-loop sketch (1 V → ~13 A peak, under the ESC1's OCP).
+const float VOLTAGE_CEIL  = 3.0f;     // ceiling on Uq from the velocity PI
+// During initFOC's index search the motor spins at ~1 rad/s in voltage
+// open-loop. At that speed BEMF ≈ 0, so this voltage is dropped almost
+// entirely across phase resistance (76 mΩ) — keep it at the same level we
+// proved safe in the open-loop sketch or the ESC1 OCP will trip.
 const float ALIGN_VOLTAGE = 1.0f;
 const float MAX_VEL_RAD_S = 20.0f;
-const float CURRENT_LIMIT = 15.0f;    // max Iq the velocity PI can command [A]
 
 BLDCMotor      motor   = BLDCMotor(POLE_PAIRS);
 BLDCDriver6PWM driver  = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
@@ -60,7 +59,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   SimpleFOCDebug::enable(&Serial);
-  Serial.println("==== ESC1 closed-loop velocity + foc_current ====");
+  Serial.println("==== ESC1 closed-loop velocity + current sense (read-only) ====");
 
   pinMode(USER_BTN, INPUT_PULLUP);
   analogReadResolution(12);
@@ -92,33 +91,16 @@ void setup() {
   motor.voltage_limit        = VOLTAGE_CEIL;
   motor.voltage_sensor_align = ALIGN_VOLTAGE;
   motor.velocity_limit       = MAX_VEL_RAD_S;
-  motor.current_limit        = CURRENT_LIMIT;
 
   motor.controller        = MotionControlType::velocity;
-  motor.torque_controller = TorqueControlType::foc_current;
+  motor.torque_controller = TorqueControlType::voltage;
 
-  // Outer velocity loop now outputs an Iq SETPOINT in amps (not volts).
-  // Conservative starting gains — expect to tune.
-  motor.PID_velocity.P           = 0.5f;     // A per (rad/s) error
-  motor.PID_velocity.I           = 20.0f;
-  motor.PID_velocity.D           = 0.0f;
-  motor.PID_velocity.output_ramp = 2000.0f;  // A/s slew on Iq command
-  motor.LPF_velocity.Tf          = 0.015f;   // 15 ms LPF on encoder velocity
-
-  // Inner Iq / Id current loops. Output is Uq / Ud in volts, clipped to
-  // motor.voltage_limit. SimpleFOC defaults (P=3, I=300) assume ~1 Ω motors;
-  // this 76 mΩ winding is much faster electrically, so use lower P and I to
-  // start, raise once stable.
-  motor.PID_current_q.P           = 0.5f;
-  motor.PID_current_q.I           = 50.0f;
-  motor.PID_current_q.D           = 0.0f;
-  motor.PID_current_q.output_ramp = 0.0f;
-  motor.LPF_current_q.Tf          = 0.005f;
-  motor.PID_current_d.P           = 0.5f;
-  motor.PID_current_d.I           = 50.0f;
-  motor.PID_current_d.D           = 0.0f;
-  motor.PID_current_d.output_ramp = 0.0f;
-  motor.LPF_current_d.Tf          = 0.005f;
+  // Conservative starting gains for a 14pp motor — expect to tune.
+  motor.PID_velocity.P            = 0.05f;
+  motor.PID_velocity.I            = 2.0f;
+  motor.PID_velocity.D            = 0.0f;
+  motor.PID_velocity.output_ramp  = 100.0f;   // V/s slew on Uq
+  motor.LPF_velocity.Tf           = 0.01f;    // 10 ms LPF on encoder velocity
 
   if (!motor.init()) {
     Serial.println("motor.init FAILED");
@@ -157,13 +139,21 @@ void loop() {
   motor.move(target);
 
   if (millis() - last_print_ms >= 500) {
+    // motor.current.q/d are NOT populated in voltage torque mode — read
+    // explicitly so we can verify the current-sense path before turning on
+    // the foc_current controller.
+    PhaseCurrent_s ph = current_sense.getPhaseCurrents();
+    DQCurrent_s    dq = current_sense.getFOCCurrents(motor.electrical_angle);
+
     Serial.print("en=");      Serial.print(enabled ? 1 : 0);
     Serial.print(" tgt=");    Serial.print(target, 2);
     Serial.print(" vel=");    Serial.print(motor.shaft_velocity, 2);
-    Serial.print(" Iq_sp=");  Serial.print(motor.current_sp, 2);
-    Serial.print(" Iq=");     Serial.print(motor.current.q, 2);
-    Serial.print(" Id=");     Serial.print(motor.current.d, 2);
-    Serial.print(" Uq=");     Serial.println(motor.voltage.q, 2);
+    Serial.print(" Uq=");     Serial.print(motor.voltage.q, 2);
+    Serial.print(" Ia=");     Serial.print(ph.a, 3);
+    Serial.print(" Ib=");     Serial.print(ph.b, 3);
+    Serial.print(" Ic=");     Serial.print(ph.c, 3);
+    Serial.print(" Iq=");     Serial.print(dq.q, 3);
+    Serial.print(" Id=");     Serial.println(dq.d, 3);
     last_print_ms = millis();
   }
 }
