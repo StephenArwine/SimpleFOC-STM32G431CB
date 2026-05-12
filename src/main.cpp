@@ -1,35 +1,33 @@
 #include <Arduino.h>
 #include <SimpleFOC.h>
+#include <string.h>
 
-// Step (d) closed-loop bring-up: full FOC with foc_current torque mode.
-// Outer velocity PI -> Iq setpoint -> inner Iq/Id PI -> Uq/Ud. This gives
-// hard current limiting, predictable torque-per-amp across speed, and is the
-// control mode we want for the balance bot's wheels.
+// Step (e) closed-loop FOC + CAN reception. The control architecture from
+// step (d) is unchanged (velocity outer loop -> Iq inner loop, foc_current
+// torque mode). Velocity setpoint arrives over CAN at 1 Mbps, classic
+// frames, ID = CAN_ID_TARGET, payload = 4-byte little-endian float32 in
+// rad/s. Motor is enabled at boot and tracks the latest CAN setpoint; if
+// no fresh frame has been seen within CAN_RX_TIMEOUT_MS the target is
+// forced to zero so the rig coasts to a stop instead of running away.
 //
 // Hardware: B-G431B-ESC1 + 300Kv 14pp 76mΩ prop motor, AMT103 on J8
 //   (PB6=A, PB7=B, PB8=Z wired but unused, 2048 PPR -> 8192 cpr x4).
 //   PSU 16 V, 3 mΩ low-side shunts via on-chip OPAMPs (PGA gain -64/7).
-//
-// Shunt + gain values from SimpleFOC ESC1 reference example. Gain is
-// negative because the ESC1 wires the OPAMPs in inverting configuration.
-//
-// Z (index) is intentionally NOT passed to the Encoder ctor: SimpleFOC's
-// initFOC will then skip absoluteZeroSearch(), which spins the rotor at
-// 1 rad/s in voltage open-loop — too slow on this low-R motor without
-// tripping the ESC1 OCP. Velocity control doesn't need absolute zero;
-// alignSensor() (which already passes) is sufficient.
+//   FDCAN1 to onboard TJA1051 transceiver: PA11=RX, PB9=TX,
+//                                          PC11=SHDN (low=run),
+//                                          PC14=TERM (high=120Ω on).
 
 const int   POLE_PAIRS    = 14;
 const int   ENCODER_PPR   = 2048;
 const float PSU_VOLTAGE   = 16.0f;
-const float VOLTAGE_CEIL  = 3.0f;     // ceiling on Uq from the inner Iq PI
-// During initFOC's sensor alignment the motor settles at fixed electrical
-// positions for ~1 s each. With BEMF ≈ 0 the entire ALIGN_VOLTAGE is dropped
-// across the 76 mΩ phase resistance, so keep this at the level we proved
-// safe in the open-loop sketch (1 V → ~13 A peak, under the ESC1's OCP).
+const float VOLTAGE_CEIL  = 2.0f;
 const float ALIGN_VOLTAGE = 1.0f;
 const float MAX_VEL_RAD_S = 20.0f;
-const float CURRENT_LIMIT = 15.0f;    // max Iq the velocity PI can command [A]
+const float CURRENT_LIMIT = 15.0f;
+
+// CAN config — change CAN_ID_TARGET per board to address left vs right ESC.
+constexpr uint32_t CAN_ID_TARGET     = 0x100;   // float32 LE velocity [rad/s]
+constexpr uint32_t CAN_RX_TIMEOUT_MS = 200;     // target -> 0 if frame older
 
 BLDCMotor      motor   = BLDCMotor(POLE_PAIRS);
 BLDCDriver6PWM driver  = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
@@ -41,29 +39,113 @@ LowsideCurrentSense current_sense = LowsideCurrentSense(
   A_OP1_OUT, A_OP2_OUT, A_OP3_OUT
 );
 
-// LowsideCurrentSense takes over ADC1 in DMA-circular mode triggered by
-// TIM1, so analogRead(A_POTENTIOMETER) no longer works (PB12 is ADC1_IN11).
-// SimpleFOC's ESC1 init already samples the pot as rank 2 of the scan and
-// stores it in adcBuffer1[1] (with OPAMP_USE_INTERNAL_CHANNEL=1, default).
-// Grab the value directly from the DMA buffer.
-extern volatile uint16_t adcBuffer1[];
-
 void doA() { encoder.handleA(); }
 void doB() { encoder.handleB(); }
 
-bool     enabled        = false;
-uint32_t last_btn_ms    = 0;
-int      last_btn_state = HIGH;
-uint32_t last_print_ms  = 0;
+uint32_t last_print_ms = 0;
+
+// === CAN reception ===
+FDCAN_HandleTypeDef hfdcan1;
+volatile float      can_target     = 0.0f;
+volatile uint32_t   can_last_rx_ms = 0;
+volatile uint32_t   can_rx_count   = 0;
+
+static void can_init() {
+  // FDCAN kernel clock from PCLK1 (= 170 MHz on this board's stm32duino default)
+  RCC_PeriphCLKInitTypeDef pclk = {};
+  pclk.PeriphClockSelection = RCC_PERIPHCLK_FDCAN;
+  pclk.FdcanClockSelection  = RCC_FDCANCLKSOURCE_PCLK1;
+  HAL_RCCEx_PeriphCLKConfig(&pclk);
+  __HAL_RCC_FDCAN_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  // PA11 = FDCAN1_RX, PB9 = FDCAN1_TX (AF9 on STM32G4)
+  GPIO_InitTypeDef g = {};
+  g.Mode      = GPIO_MODE_AF_PP;
+  g.Pull      = GPIO_NOPULL;
+  g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  g.Alternate = GPIO_AF9_FDCAN1;
+  g.Pin       = GPIO_PIN_11; HAL_GPIO_Init(GPIOA, &g);
+  g.Pin       = GPIO_PIN_9;  HAL_GPIO_Init(GPIOB, &g);
+
+  // Enable onboard transceiver and turn on bus terminator. If this ESC is
+  // *not* at a physical end of the bus, drive A_CAN_TERM low instead.
+  pinMode(A_CAN_SHDN, OUTPUT); digitalWrite(A_CAN_SHDN, LOW);
+  pinMode(A_CAN_TERM, OUTPUT); digitalWrite(A_CAN_TERM, HIGH);
+
+  // 1 Mbps timing with FDCAN kernel clock = 170 MHz:
+  //   tq = 100 ns (prescaler 17), 10 tq/bit (1 sync + 7 tseg1 + 2 tseg2),
+  //   sample point = 80%.
+  hfdcan1.Instance                  = FDCAN1;
+  hfdcan1.Init.ClockDivider         = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat          = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode                 = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission   = ENABLE;
+  hfdcan1.Init.TransmitPause        = DISABLE;
+  hfdcan1.Init.ProtocolException    = DISABLE;
+  hfdcan1.Init.NominalPrescaler     = 17;
+  hfdcan1.Init.NominalSyncJumpWidth = 2;
+  hfdcan1.Init.NominalTimeSeg1      = 7;
+  hfdcan1.Init.NominalTimeSeg2      = 2;
+  hfdcan1.Init.StdFiltersNbr        = 1;
+  hfdcan1.Init.ExtFiltersNbr        = 0;
+  hfdcan1.Init.TxFifoQueueMode      = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
+    Serial.println("FDCAN init FAILED");
+    return;
+  }
+
+  // Accept exactly CAN_ID_TARGET into RX FIFO 0; reject everything else.
+  FDCAN_FilterTypeDef f = {};
+  f.IdType       = FDCAN_STANDARD_ID;
+  f.FilterIndex  = 0;
+  f.FilterType   = FDCAN_FILTER_DUAL;
+  f.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  f.FilterID1    = CAN_ID_TARGET;
+  f.FilterID2    = CAN_ID_TARGET;
+  HAL_FDCAN_ConfigFilter(&hfdcan1, &f);
+  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                               FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
+
+  HAL_FDCAN_Start(&hfdcan1);
+  HAL_FDCAN_ActivateNotification(&hfdcan1,
+                                  FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(FDCAN1_IT0_IRQn);
+}
+
+extern "C" void FDCAN1_IT0_IRQHandler(void) {
+  HAL_FDCAN_IRQHandler(&hfdcan1);
+}
+
+extern "C" void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
+                                          uint32_t RxFifo0ITs) {
+  if (!(RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE)) return;
+  FDCAN_RxHeaderTypeDef h;
+  uint8_t buf[8];
+  while (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &h, buf) == HAL_OK) {
+    if (h.Identifier == CAN_ID_TARGET && h.DataLength >= FDCAN_DLC_BYTES_4) {
+      float v;
+      memcpy(&v, buf, sizeof(float));
+      can_target     = v;
+      can_last_rx_ms = HAL_GetTick();
+      can_rx_count++;
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   delay(500);
   SimpleFOCDebug::enable(&Serial);
-  Serial.println("==== ESC1 closed-loop velocity + foc_current ====");
+  Serial.println("==== ESC1 closed-loop velocity + foc_current + CAN ====");
 
-  pinMode(USER_BTN, INPUT_PULLUP);
-  analogReadResolution(12);
+  // Diagnostic: FDCAN baud math in can_init() assumes PCLK1 = 170 MHz.
+  Serial.print("HCLK=");   Serial.print(HAL_RCC_GetHCLKFreq());
+  Serial.print(" PCLK1="); Serial.print(HAL_RCC_GetPCLK1Freq());
+  Serial.print(" PCLK2="); Serial.println(HAL_RCC_GetPCLK2Freq());
 
   encoder.init();
   encoder.enableInterrupts(doA, doB);
@@ -71,16 +153,13 @@ void setup() {
 
   driver.voltage_power_supply = PSU_VOLTAGE;
   driver.voltage_limit        = VOLTAGE_CEIL;
-  driver.dead_zone            = 0.005f;     // verified on this board
+  driver.dead_zone            = 0.005f;
   if (!driver.init()) {
     Serial.println("driver.init FAILED");
     while (1) delay(1000);
   }
   motor.linkDriver(&driver);
 
-  // Current sense: read-only this step. Phase wiring on the ESC1 is fixed,
-  // so we skip the auto-alignment that injects voltages to figure out which
-  // ADC channel maps to which phase.
   current_sense.linkDriver(&driver);
   if (!current_sense.init()) {
     Serial.println("current_sense.init FAILED");
@@ -97,18 +176,12 @@ void setup() {
   motor.controller        = MotionControlType::velocity;
   motor.torque_controller = TorqueControlType::foc_current;
 
-  // Outer velocity loop now outputs an Iq SETPOINT in amps (not volts).
-  // Conservative starting gains — expect to tune.
-  motor.PID_velocity.P           = 0.5f;     // A per (rad/s) error
+  motor.PID_velocity.P           = 0.5f;
   motor.PID_velocity.I           = 20.0f;
   motor.PID_velocity.D           = 0.0f;
-  motor.PID_velocity.output_ramp = 2000.0f;  // A/s slew on Iq command
-  motor.LPF_velocity.Tf          = 0.015f;   // 15 ms LPF on encoder velocity
+  motor.PID_velocity.output_ramp = 2000.0f;
+  motor.LPF_velocity.Tf          = 0.015f;
 
-  // Inner Iq / Id current loops. Output is Uq / Ud in volts, clipped to
-  // motor.voltage_limit. SimpleFOC defaults (P=3, I=300) assume ~1 Ω motors;
-  // this 76 mΩ winding is much faster electrically, so use lower P and I to
-  // start, raise once stable.
   motor.PID_current_q.P           = 0.5f;
   motor.PID_current_q.I           = 50.0f;
   motor.PID_current_q.D           = 0.0f;
@@ -125,8 +198,6 @@ void setup() {
     while (1) delay(1000);
   }
 
-  // initFOC spins the rotor a fraction of a turn for electrical-zero alignment
-  // and to detect encoder direction. Make sure nothing is binding the shaft.
   Serial.println("Aligning rotor (will move)...");
   if (!motor.initFOC()) {
     Serial.println("initFOC FAILED");
@@ -134,36 +205,33 @@ void setup() {
   }
   Serial.println("Alignment OK.");
 
-  motor.disable();
-  Serial.println("Press USER button to enable. Pot sets target velocity.");
+  // Bring up CAN after FOC is ready so an early frame can't surprise us.
+  can_init();
+  Serial.print("CAN listening on ID 0x");
+  Serial.println(CAN_ID_TARGET, HEX);
+
+  motor.enable();
+  Serial.println("Motor enabled. Tracking CAN setpoint; target -> 0 if stale.");
 }
 
 void loop() {
-  int btn = digitalRead(USER_BTN);
-  if (btn == LOW && last_btn_state == HIGH && (millis() - last_btn_ms) > 200) {
-    enabled = !enabled;
-    if (enabled) motor.enable();
-    else         motor.disable();
-    Serial.println(enabled ? "ENABLED" : "DISABLED");
-    last_btn_ms = millis();
-  }
-  last_btn_state = btn;
-
-  int   raw    = adcBuffer1[1];           // pot, sampled by current-sense DMA
-  float pot    = raw / 4095.0f;
-  float target = pot * MAX_VEL_RAD_S;
+  uint32_t now = millis();
+  bool can_fresh = (can_last_rx_ms != 0) &&
+                   (now - can_last_rx_ms < CAN_RX_TIMEOUT_MS);
+  float target = can_fresh ? can_target : 0.0f;
+  target = _constrain(target, -MAX_VEL_RAD_S, MAX_VEL_RAD_S);
 
   motor.loopFOC();
   motor.move(target);
 
-  if (millis() - last_print_ms >= 500) {
-    Serial.print("en=");      Serial.print(enabled ? 1 : 0);
+  if (now - last_print_ms >= 500) {
+    Serial.print("src=");     Serial.print(can_fresh ? 'C' : '-');
+    Serial.print(" rx=");     Serial.print(can_rx_count);
     Serial.print(" tgt=");    Serial.print(target, 2);
     Serial.print(" vel=");    Serial.print(motor.shaft_velocity, 2);
     Serial.print(" Iq_sp=");  Serial.print(motor.current_sp, 2);
     Serial.print(" Iq=");     Serial.print(motor.current.q, 2);
-    Serial.print(" Id=");     Serial.print(motor.current.d, 2);
     Serial.print(" Uq=");     Serial.println(motor.voltage.q, 2);
-    last_print_ms = millis();
+    last_print_ms = now;
   }
 }
